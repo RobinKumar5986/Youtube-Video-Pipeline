@@ -1,0 +1,20 @@
+*.mp*
+
+# Virtual environment
+venv/
+.venv/
+
+# Secrets and credentials
+client_secret*
+token*
+Secrets.txt
+gui_config.json
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Video Folders
+RawVideos/
+FinalVideos/
+/source

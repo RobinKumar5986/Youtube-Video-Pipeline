@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""
+SortCliper GUI - Basic control panel for the pipeline in main.py
+
+Drop this file into your Cliper project folder (next to main.py) and run:
+    python3 gui.py
+
+It shells out to `main.py` for every action, so it stays in sync with
+whatever main.py does — no duplicated pipeline logic here.
+
+Requires: pip install customtkinter
+"""
+
+import os
+import sys
+import json
+import re
+import subprocess
+import threading
+import queue
+import tkinter as tk
+
+import customtkinter as ctk
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RAW_DIR = os.path.join(BASE_DIR, "RawVideos")
+FINAL_DIR = os.path.join(BASE_DIR, "FinalVideos")
+MAIN_PY = os.path.join(BASE_DIR, "main.py")
+CONFIG_PATH = os.path.join(BASE_DIR, "gui_config.json")
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+
+# ── Screen-size aware scaling ────────────────────────────────────────────
+# We size and scale the whole UI relative to the actual display instead of
+# using fixed pixel values, so it looks right on a 13" laptop panel and on
+# a 27" monitor alike.
+
+def get_screen_metrics():
+    probe = tk.Tk()
+    probe.withdraw()
+    sw = probe.winfo_screenwidth()
+    sh = probe.winfo_screenheight()
+    probe.destroy()
+    return sw, sh
+
+
+SCREEN_W, SCREEN_H = get_screen_metrics()
+
+# 1920x1080 is our "1.0x" reference point. Clamp so tiny/huge screens don't
+# produce an unusable UI.
+_raw_scale = min(SCREEN_W / 1920, SCREEN_H / 1080)
+UI_SCALE = max(0.85, min(_raw_scale, 2.0))
+
+# customtkinter scales both widget dimensions and font sizes from this call.
+ctk.set_widget_scaling(UI_SCALE)
+ctk.set_window_scaling(UI_SCALE)
+
+# Widened: was 0.62 / 1400px max — the control rows (privacy, channel,
+# schedule interval, step buttons) were getting cramped. Now takes up more
+# of the available screen width, capped higher.
+WIN_W = min(int(SCREEN_W * 0.80), 1760)
+WIN_H = min(int(SCREEN_H * 0.78), 1000)
+WIN_MIN_W = int(SCREEN_W * 0.55)
+WIN_MIN_H = int(SCREEN_H * 0.5)
+
+# Base font sizes (pt) — these get multiplied by UI_SCALE when we build the
+# CTkFont objects, on top of customtkinter's own widget scaling, so text
+# stays comfortably legible on high-DPI/4K laptop screens too.
+FONT_BODY = round(14 * UI_SCALE)
+FONT_BOLD = round(15 * UI_SCALE)
+FONT_MONO = round(13 * UI_SCALE)
+FONT_LABEL_SMALL = round(12 * UI_SCALE)
+
+
+# ── Config persistence (remembers your last URL / privacy / etc.) ──────────
+
+def load_config() -> dict:
+    if os.path.exists(CONFIG_PATH):
+        try:
+            return json.load(open(CONFIG_PATH))
+        except Exception:
+            pass
+    return {}
+
+
+def save_config(cfg: dict):
+    try:
+        json.dump(cfg, open(CONFIG_PATH, "w"), indent=2)
+    except Exception:
+        pass
+
+
+def list_raw_folders():
+    if not os.path.isdir(RAW_DIR):
+        return []
+    return sorted(f for f in os.listdir(RAW_DIR) if os.path.isdir(os.path.join(RAW_DIR, f)))
+
+
+# Matches client_secret.json (-> "Default"), client_secret_gaming.json
+# (-> "Gaming"), and also bare-numbered/named files like client_secret1.json
+# (-> "1") or client_secret-vlogs.json (-> "Vlogs") — mirrors the regex in
+# step4_upload.discover_accounts() so both stay in sync.
+_CLIENT_SECRET_RE = re.compile(r"^client_secret[_-]?(?P<suffix>[^.]+)?\.json$")
+
+
+def list_accounts():
+    """
+    Mirrors step4_upload.discover_accounts()'s naming convention so the GUI
+    doesn't need to import that module:
+        client_secret.json           -> "Default"
+        client_secret_<name>.json    -> "<Name>"
+        client_secret<name>.json     -> "<Name>"
+    Returns a list of label strings, sorted, "Default" first if present.
+    """
+    labels = []
+    for f in sorted(os.listdir(BASE_DIR)):
+        m = _CLIENT_SECRET_RE.match(f)
+        if not m:
+            continue
+        suffix = m.group("suffix")
+        labels.append(suffix.replace("_", " ").replace("-", " ").strip().title() if suffix else "Default")
+    labels.sort(key=lambda l: (l != "Default", l))
+    return labels
+
+
+class SortCliperGUI(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("SortCliper Control Panel")
+        self.geometry(f"{WIN_W}x{WIN_H}")
+        self.minsize(WIN_MIN_W, WIN_MIN_H)
+
+        self.cfg = load_config()
+        self.proc = None
+        self.log_queue = queue.Queue()
+
+        self._build_layout()
+        self.refresh_folders()
+        self.refresh_accounts()
+        self.after(100, self._drain_log_queue)
+
+    # ── Layout ───────────────────────────────────────────────────────────
+
+    def _build_layout(self):
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(3, weight=1)
+
+        body_font = ctk.CTkFont(size=FONT_BODY)
+
+        # -- Section: Full pipeline --
+        top = ctk.CTkFrame(self)
+        top.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        top.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(top, text="YouTube URL", font=ctk.CTkFont(size=FONT_BOLD, weight="bold")).grid(
+            row=0, column=0, padx=(12, 8), pady=(12, 4), sticky="w"
+        )
+
+        self.url_entry = ctk.CTkEntry(
+            top, placeholder_text="https://youtube.com/watch?v=...",
+            font=body_font, height=round(32 * UI_SCALE)
+        )
+        self.url_entry.grid(row=0, column=1, columnspan=3, padx=(0, 12), pady=(12, 4), sticky="ew")
+        self.url_entry.insert(0, self.cfg.get("last_url", ""))
+
+        ctk.CTkLabel(top, text="Privacy", font=body_font).grid(row=1, column=0, padx=(12, 8), pady=4, sticky="w")
+        self.privacy_var = ctk.StringVar(value=self.cfg.get("privacy", "private"))
+        self.privacy_menu = ctk.CTkOptionMenu(
+            top, values=["private", "unlisted", "public"], variable=self.privacy_var,
+            font=body_font, height=round(30 * UI_SCALE)
+        )
+        self.privacy_menu.grid(row=1, column=1, padx=(0, 12), pady=4, sticky="w")
+
+        ctk.CTkLabel(top, text="Channel", font=body_font).grid(row=1, column=2, padx=(0, 8), pady=4, sticky="e")
+        self.account_var = ctk.StringVar(value="(default)")
+        self.account_menu = ctk.CTkOptionMenu(
+            top, values=["(default)"], variable=self.account_var,
+            font=body_font, height=round(30 * UI_SCALE)
+        )
+        self.account_menu.grid(row=1, column=3, padx=(0, 12), pady=4, sticky="w")
+
+        self.no_upload_var = ctk.BooleanVar(value=self.cfg.get("no_upload", False))
+        self.no_upload_check = ctk.CTkCheckBox(
+            top, text="Skip upload (stop after render)", variable=self.no_upload_var, font=body_font
+        )
+        self.no_upload_check.grid(row=2, column=0, columnspan=2, padx=12, pady=(4, 12), sticky="w")
+
+        self.run_full_btn = ctk.CTkButton(
+            top, text="▶ Run Full Pipeline", command=self.run_full_pipeline,
+            height=round(36 * UI_SCALE), font=ctk.CTkFont(size=FONT_BODY, weight="bold")
+        )
+        self.run_full_btn.grid(row=2, column=2, columnspan=2, padx=(0, 12), pady=(4, 12), sticky="e")
+
+        # -- Section: Clipping + scheduling options --
+        opts = ctk.CTkFrame(self)
+        opts.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
+        opts.grid_columnconfigure(4, weight=1)
+
+        ctk.CTkLabel(opts, text="Clipping", font=ctk.CTkFont(size=FONT_BOLD, weight="bold")).grid(
+            row=0, column=0, padx=(12, 8), pady=(12, 6), sticky="w"
+        )
+        self.ai_clip_var = ctk.BooleanVar(value=self.cfg.get("ai_clip", True))
+        self.ai_clip_check = ctk.CTkCheckBox(
+            opts, text="Clip by AI (uncheck = fixed 1-minute clips, no AI analysis)",
+            variable=self.ai_clip_var, font=body_font
+        )
+        self.ai_clip_check.grid(row=0, column=1, columnspan=3, padx=(0, 12), pady=(12, 6), sticky="w")
+
+        ctk.CTkLabel(opts, text="Publishing", font=ctk.CTkFont(size=FONT_BOLD, weight="bold")).grid(
+            row=1, column=0, padx=(12, 8), pady=(6, 12), sticky="w"
+        )
+        self.schedule_var = ctk.BooleanVar(value=self.cfg.get("schedule", False))
+        self.schedule_check = ctk.CTkCheckBox(
+            opts, text="Schedule uploads (drip-publish instead of all at once)",
+            variable=self.schedule_var, font=body_font, command=self._on_schedule_toggle
+        )
+        self.schedule_check.grid(row=1, column=1, padx=(0, 12), pady=(6, 12), sticky="w")
+
+        ctk.CTkLabel(opts, text="Every", font=body_font).grid(row=1, column=2, padx=(12, 6), pady=(6, 12), sticky="e")
+        self.schedule_interval_var = ctk.StringVar(value=str(self.cfg.get("schedule_interval", 2)))
+        self.schedule_interval_entry = ctk.CTkEntry(
+            opts, textvariable=self.schedule_interval_var, width=round(60 * UI_SCALE),
+            font=body_font, height=round(30 * UI_SCALE), justify="center"
+        )
+        self.schedule_interval_entry.grid(row=1, column=3, padx=(0, 4), pady=(6, 12), sticky="w")
+        ctk.CTkLabel(opts, text="hours apart", font=body_font).grid(
+            row=1, column=4, padx=(4, 12), pady=(6, 12), sticky="w"
+        )
+        self._on_schedule_toggle()
+
+        # -- Section: Step-by-step + folder select --
+        mid = ctk.CTkFrame(self)
+        mid.grid(row=2, column=0, sticky="ew", padx=16, pady=8)
+        mid.grid_columnconfigure(4, weight=1)
+
+        ctk.CTkLabel(mid, text="Target folder (RawVideos/)", font=ctk.CTkFont(size=FONT_BOLD, weight="bold")).grid(
+            row=0, column=0, padx=(12, 8), pady=(12, 4), sticky="w"
+        )
+        self.folder_var = ctk.StringVar(value="(none)")
+        self.folder_menu = ctk.CTkOptionMenu(
+            mid, values=["(none)"], variable=self.folder_var,
+            font=body_font, height=round(30 * UI_SCALE)
+        )
+        self.folder_menu.grid(row=0, column=1, padx=(0, 8), pady=(12, 4), sticky="w")
+
+        self.refresh_btn = ctk.CTkButton(
+            mid, text="↻ Refresh", width=round(100 * UI_SCALE), height=round(30 * UI_SCALE),
+            font=body_font, command=self.refresh_all
+        )
+        self.refresh_btn.grid(row=0, column=2, padx=(0, 12), pady=(12, 4), sticky="w")
+
+        ctk.CTkLabel(mid, text="Steps:", font=ctk.CTkFont(size=FONT_BOLD, weight="bold")).grid(
+            row=1, column=0, padx=(12, 8), pady=(4, 12), sticky="w"
+        )
+        step_bar = ctk.CTkFrame(mid, fg_color="transparent")
+        step_bar.grid(row=1, column=1, columnspan=4, padx=(0, 12), pady=(4, 12), sticky="ew")
+
+        btn_w = round(150 * UI_SCALE)
+        btn_h = round(34 * UI_SCALE)
+        self.step1_btn = ctk.CTkButton(
+            step_bar, text="1. Download", width=btn_w, height=btn_h, font=body_font, command=self.run_step1
+        )
+        self.step1_btn.pack(side="left", padx=(0, 6))
+        self.step2_btn = ctk.CTkButton(
+            step_bar, text="2. Plan clips", width=btn_w, height=btn_h, font=body_font, command=self.run_step2
+        )
+        self.step2_btn.pack(side="left", padx=6)
+        self.step3_btn = ctk.CTkButton(
+            step_bar, text="3. Render", width=btn_w, height=btn_h, font=body_font, command=self.run_step3
+        )
+        self.step3_btn.pack(side="left", padx=6)
+        self.step4_btn = ctk.CTkButton(
+            step_bar, text="4. Upload", width=btn_w, height=btn_h, font=body_font, command=self.run_step4
+        )
+        self.step4_btn.pack(side="left", padx=6)
+
+        self.cancel_btn = ctk.CTkButton(
+            step_bar, text="■ Cancel", width=round(110 * UI_SCALE), height=btn_h,
+            font=body_font, fg_color="#8B2E2E", hover_color="#6E2424",
+            command=self.cancel_process
+        )
+        self.cancel_btn.pack(side="right")
+
+        # -- Section: Log console --
+        log_frame = ctk.CTkFrame(self)
+        log_frame.grid(row=3, column=0, sticky="nsew", padx=16, pady=(8, 16))
+        log_frame.grid_columnconfigure(0, weight=1)
+        log_frame.grid_rowconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(log_frame, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 0))
+        ctk.CTkLabel(header, text="Log", font=ctk.CTkFont(size=FONT_BOLD, weight="bold")).pack(side="left")
+        self.status_label = ctk.CTkLabel(
+            header, text="Idle", text_color="#8a8a8a", font=ctk.CTkFont(size=FONT_LABEL_SMALL)
+        )
+        self.status_label.pack(side="right")
+
+        self.log_box = ctk.CTkTextbox(log_frame, wrap="word", font=ctk.CTkFont(family="monospace", size=FONT_MONO))
+        self.log_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=12)
+        self.log_box.configure(state="disabled")
+
+    def _on_schedule_toggle(self):
+        state = "normal" if self.schedule_var.get() else "disabled"
+        self.schedule_interval_entry.configure(state=state)
+
+    # ── Folder handling ─────────────────────────────────────────────────
+
+    def refresh_all(self):
+        self.refresh_folders()
+        self.refresh_accounts()
+
+    def refresh_folders(self):
+        folders = list_raw_folders()
+        values = folders if folders else ["(none)"]
+        self.folder_menu.configure(values=values)
+        last = self.cfg.get("last_folder")
+        if last in folders:
+            self.folder_var.set(last)
+        else:
+            self.folder_var.set(values[0])
+
+    def selected_folder_index(self, folders):
+        """1-based index matching main.py's select_video_dir() ordering."""
+        current = self.folder_var.get()
+        if current in folders:
+            return folders.index(current) + 1
+        return 1
+
+    # ── Channel/account handling ─────────────────────────────────────────
+
+    def refresh_accounts(self):
+        labels = list_accounts()
+        values = labels if labels else ["(default)"]
+        self.account_menu.configure(values=values)
+        last = self.cfg.get("last_account")
+        if last in labels:
+            self.account_var.set(last)
+        else:
+            self.account_var.set(values[0])
+
+    def selected_account_args(self):
+        """Returns ['--account', label] to append to a main.py call, or []
+        if there's nothing to pass (no client_secret*.json set up yet)."""
+        if not list_accounts():
+            return []
+        label = self.account_var.get()
+        if not label or label == "(default)":
+            return []
+        return ["--account", label]
+
+    # ── Clipping / scheduling option handling ────────────────────────────
+
+    def clip_args(self):
+        """Returns [] if AI clipping is on (default main.py behavior), or
+        ['--no-ai-clip'] if the checkbox is unchecked."""
+        return [] if self.ai_clip_var.get() else ["--no-ai-clip"]
+
+    def schedule_args(self):
+        """Returns ['--schedule', '--schedule-interval', 'N'] if scheduling
+        is enabled, else []. Falls back to 2 (and warns) on a bad interval."""
+        if not self.schedule_var.get():
+            return []
+        raw = self.schedule_interval_var.get().strip()
+        try:
+            interval = float(raw)
+            if interval <= 0:
+                raise ValueError
+        except ValueError:
+            self._log(f"⚠ Invalid schedule interval '{raw}' — using default of 2 hours.\n")
+            interval = 2
+            self.schedule_interval_var.set("2")
+        return ["--schedule", "--schedule-interval", str(interval)]
+
+    # ── Command runners ──────────────────────────────────────────────────
+
+    def run_full_pipeline(self):
+        url = self.url_entry.get().strip()
+        if not url:
+            self._log("❌ Enter a YouTube URL first.\n")
+            return
+        privacy = self.privacy_var.get()
+        args = [url, "--privacy", privacy]
+        args += self.clip_args()
+        if not self.no_upload_var.get():
+            args += self.selected_account_args()
+            args += self.schedule_args()
+        if self.no_upload_var.get():
+            args.append("--no-upload")
+        self._persist_config(
+            url=url, privacy=privacy, no_upload=self.no_upload_var.get(),
+            last_account=self.account_var.get(),
+            ai_clip=self.ai_clip_var.get(),
+            schedule=self.schedule_var.get(),
+            schedule_interval=self.schedule_interval_var.get(),
+        )
+        self._run(args, stdin_lines=None)
+
+    def run_step1(self):
+        url = self.url_entry.get().strip()
+        if not url:
+            self._log("❌ Step 1 needs a YouTube URL.\n")
+            return
+        self._persist_config(url=url)
+        self._run(["1", url])
+
+    def run_step2(self):
+        self._persist_config(ai_clip=self.ai_clip_var.get())
+        self._run_with_folder_choice(["2"] + self.clip_args())
+
+    def run_step3(self):
+        self._run_with_folder_choice(["3"])
+
+    def run_step4(self):
+        privacy = self.privacy_var.get()
+        self._persist_config(
+            privacy=privacy, last_account=self.account_var.get(),
+            schedule=self.schedule_var.get(), schedule_interval=self.schedule_interval_var.get(),
+        )
+        args = ["4", "--privacy", privacy] + self.selected_account_args() + self.schedule_args()
+        self._run_with_folder_choice(args)
+
+    def _run_with_folder_choice(self, args):
+        folders = list_raw_folders()
+        if not folders:
+            self._log("❌ No folders in RawVideos/ yet. Run step 1 first.\n")
+            return
+        idx = self.selected_folder_index(folders)
+        self._persist_config(last_folder=folders[idx - 1])
+        # main.py only prompts when there's more than one folder; feeding the
+        # index on stdin is harmless even if it isn't needed.
+        self._run(args, stdin_lines=[str(idx)])
+
+    def cancel_process(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            self._log("\n■ Cancelled by user.\n")
+            self._set_status("Cancelled", "#c99a2e")
+
+    # ── Subprocess execution ─────────────────────────────────────────────
+
+    def _run(self, args, stdin_lines=None):
+        if self.proc and self.proc.poll() is None:
+            self._log("⚠ A step is already running. Cancel it first.\n")
+            return
+        if not os.path.exists(MAIN_PY):
+            self._log(f"❌ Couldn't find main.py at {MAIN_PY}\n")
+            return
+
+        self._set_buttons_enabled(False)
+        self._set_status("Running…", "#3ea6ff")
+        self._log(f"\n$ python3 main.py {' '.join(args)}\n")
+
+        def worker():
+            try:
+                self.proc = subprocess.Popen(
+                    [sys.executable, MAIN_PY, *args],
+                    cwd=BASE_DIR,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                if stdin_lines:
+                    for line in stdin_lines:
+                        self.proc.stdin.write(line + "\n")
+                    self.proc.stdin.flush()
+                self.proc.stdin.close()
+
+                for line in self.proc.stdout:
+                    self.log_queue.put(line)
+
+                code = self.proc.wait()
+                if code == 0:
+                    self.log_queue.put("\n✅ Done.\n")
+                    self.log_queue.put(("__status__", "Done", "#3ec96e"))
+                else:
+                    self.log_queue.put(f"\n❌ Exited with code {code}.\n")
+                    self.log_queue.put(("__status__", "Failed", "#e05a5a"))
+            except Exception as e:
+                self.log_queue.put(f"\n❌ Error launching process: {e}\n")
+                self.log_queue.put(("__status__", "Error", "#e05a5a"))
+            finally:
+                self.log_queue.put(("__enable__",))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _drain_log_queue(self):
+        try:
+            while True:
+                item = self.log_queue.get_nowait()
+                if isinstance(item, tuple):
+                    if item[0] == "__status__":
+                        self._set_status(item[1], item[2])
+                    elif item[0] == "__enable__":
+                        self._set_buttons_enabled(True)
+                        self.refresh_all()
+                else:
+                    self._log(item)
+        except queue.Empty:
+            pass
+        self.after(100, self._drain_log_queue)
+
+    # ── UI helpers ───────────────────────────────────────────────────────
+
+    def _log(self, text):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", text)
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def _set_status(self, text, color):
+        self.status_label.configure(text=text, text_color=color)
+
+    def _set_buttons_enabled(self, enabled: bool):
+        state = "normal" if enabled else "disabled"
+        for b in (self.run_full_btn, self.step1_btn, self.step2_btn, self.step3_btn, self.step4_btn):
+            b.configure(state=state)
+
+    def _persist_config(self, **kwargs):
+        for k, v in kwargs.items():
+            self.cfg[k] = v
+        self.cfg.setdefault("last_url", self.url_entry.get().strip())
+        save_config(self.cfg)
+
+
+if __name__ == "__main__":
+    app = SortCliperGUI()
+    app.mainloop()
