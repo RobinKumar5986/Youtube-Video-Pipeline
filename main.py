@@ -5,18 +5,20 @@ SortCliper - Main Pipeline Controller
 Usage:
   python3 main.py <youtube_url> [--privacy private|unlisted|public] [--account NAME] [--no-upload]
                    [--no-ai-clip] [--schedule] [--schedule-interval HOURS]
+                   [--max-length SECONDS] [--model NAME] [--country "United States"]
       → runs the full pipeline (download → clip → render → upload)
 
   python3 main.py 1 <youtube_url>
       → Step 1 only: download
 
-  python3 main.py 2 [--no-ai-clip]
+  python3 main.py 2 [--no-ai-clip] [--max-length SECONDS] [--model NAME]
       → Step 2 only: plan clips for an existing RawVideos/ folder
 
   python3 main.py 3
       → Step 3 only: render an existing clip plan
 
-  python3 main.py 4 [--privacy private|unlisted|public] [--account NAME] [--schedule] [--schedule-interval HOURS]
+  python3 main.py 4 [--privacy private|unlisted|public] [--account NAME] [--schedule]
+                     [--schedule-interval HOURS] [--model NAME] [--country "United States"]
       → Step 4 only: generate metadata + upload already-rendered clips
 
   Steps 2-4 prompt you to pick a folder if more than one exists in
@@ -31,11 +33,29 @@ Usage:
 
   --no-ai-clip disables the Ollama-based clip planning in Step 2 (no ad/
   intro/outro detection, no sentence-boundary snapping). Instead the entire
-  video is mechanically cut into fixed ~1-minute clips.
+  video is mechanically cut into fixed-length clips (see --max-length).
+
+  --max-length SECONDS caps how long each Short can be. In AI-clip mode
+  this is the upper bound clips get snapped down to; in --no-ai-clip mode
+  it's the exact length every clip is cut to. Defaults to 150s (AI mode) /
+  60s (fixed mode) if omitted.
+
+  --model NAME picks the Ollama model used for BOTH the Step 2 skip-range
+  analysis AND the Step 4 metadata generation, so the whole run uses one
+  consistent model instead of two independently-configured ones. Omit to
+  keep each step's own default behavior (Step 2 will prompt interactively;
+  Step 4 uses OLLAMA_MODEL/env or its built-in default).
+
+  --country "United States" tailors Step 4's generated titles/descriptions/
+  hashtags and (if --schedule is set) publish timing toward that audience.
+  See step4_upload.TARGET_COUNTRIES for the supported list and the exact
+  strategy used per country. Since this pipeline only downloads English
+  source videos, pick an English-speaking or highly English-fluent market.
 
   --schedule uploads clips on a drip schedule instead of publishing them all
   at once: clips are uploaded privately with a publishAt timestamp spaced
-  --schedule-interval hours apart (default: 2h).
+  --schedule-interval hours apart (default: 2h), snapped into --country's
+  local peak-hours window when a country is given.
 """
 
 import os
@@ -47,7 +67,7 @@ import argparse
 from step1_download import download_video
 from step2_clip     import clip_pipeline, parse_srt
 from step3_overlay  import overlay_pipeline
-from step4_upload    import upload_pipeline, discover_accounts
+from step4_upload    import upload_pipeline, discover_accounts, TARGET_COUNTRIES
 
 BASE_DIR  = os.path.dirname(__file__)
 RAW_DIR   = os.path.join(BASE_DIR, "RawVideos")
@@ -179,6 +199,9 @@ def run_pipeline(
     use_ai: bool = True,
     schedule: bool = False,
     schedule_interval: float = 2.0,
+    max_clip_length: float = None,
+    model: str = None,
+    country: str = None,
 ):
     print("=" * 50)
     print("         SortCliper Pipeline")
@@ -188,7 +211,7 @@ def run_pipeline(
     video_dir = download_video(url)
     print(f"[Step 1] Done → {video_dir}")
 
-    plan = clip_pipeline(video_dir, use_ai=use_ai)
+    plan = clip_pipeline(video_dir, use_ai=use_ai, max_clip_length=max_clip_length, model=model)
     print(f"[Step 2] Done — {len(plan['clips'])} clips planned")
 
     final_dir = overlay_pipeline(plan)
@@ -204,6 +227,7 @@ def run_pipeline(
         plan, final_dir, privacy=privacy,
         client_secret_file=acc["client_secret"], token_file=acc["token"],
         schedule=schedule, schedule_interval_hours=schedule_interval,
+        model=model, country=country,
     )
     print_summary(final_dir, uploaded)
 
@@ -218,6 +242,9 @@ def run_step(
     use_ai: bool = True,
     schedule: bool = False,
     schedule_interval: float = 2.0,
+    max_clip_length: float = None,
+    model: str = None,
+    country: str = None,
 ):
     if step == 1:
         if not url:
@@ -230,7 +257,7 @@ def run_step(
     video_dir = select_video_dir()
 
     if step == 2:
-        plan = clip_pipeline(video_dir, use_ai=use_ai)
+        plan = clip_pipeline(video_dir, use_ai=use_ai, max_clip_length=max_clip_length, model=model)
         print(f"[Step 2] Done — {len(plan['clips'])} clips planned")
         return
 
@@ -251,6 +278,7 @@ def run_step(
             plan, final_dir, privacy=privacy,
             client_secret_file=acc["client_secret"], token_file=acc["token"],
             schedule=schedule, schedule_interval_hours=schedule_interval,
+            model=model, country=country,
         )
         print_summary(final_dir, uploaded)
         return
@@ -281,7 +309,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--no-ai-clip", action="store_true",
-        help="Disable AI-based clip planning (Step 2); just cut the whole video into fixed 1-minute clips."
+        help="Disable AI-based clip planning (Step 2); just cut the whole video into fixed-length clips."
     )
     parser.add_argument(
         "--schedule", action="store_true",
@@ -290,6 +318,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--schedule-interval", type=float, default=2.0,
         help="Hours between each scheduled upload when --schedule is set (default: 2)."
+    )
+    parser.add_argument(
+        "--max-length", type=float, default=None,
+        help="Max clip length in seconds (AI mode: upper bound; --no-ai-clip mode: exact length). "
+             "Defaults to 150s / 60s respectively if omitted."
+    )
+    parser.add_argument(
+        "--model", default=None,
+        help="Ollama model used for BOTH Step 2 clip analysis and Step 4 metadata generation."
+    )
+    parser.add_argument(
+        "--country", choices=list(TARGET_COUNTRIES.keys()), default=None,
+        help="Target audience country for Step 4 metadata/hashtags/scheduling strategy."
     )
     args = parser.parse_args()
 
@@ -303,9 +344,11 @@ if __name__ == "__main__":
         run_step(
             step, url=args.extra_url, privacy=args.privacy, account=args.account,
             use_ai=use_ai, schedule=args.schedule, schedule_interval=args.schedule_interval,
+            max_clip_length=args.max_length, model=args.model, country=args.country,
         )
     else:
         run_pipeline(
             args.target, privacy=args.privacy, do_upload=not args.no_upload, account=args.account,
             use_ai=use_ai, schedule=args.schedule, schedule_interval=args.schedule_interval,
+            max_clip_length=args.max_length, model=args.model, country=args.country,
         )

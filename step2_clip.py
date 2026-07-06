@@ -5,7 +5,7 @@ SortCliper - Step 2: Compute clip ranges (NO video rendering).
 - If AI clipping is enabled: asks Ollama to identify skip ranges (ads,
   intros, outros), then snaps cut points to sentence boundaries.
 - If AI clipping is disabled: skips all of that and just cuts the entire
-  video into fixed ~1-minute clips, no analysis, no Ollama call.
+  video into fixed-length clips, no analysis, no Ollama call.
 - Returns plan dict for Step 3; also saves clips_plan.json in video_dir
 """
 
@@ -20,11 +20,11 @@ import re
 OLLAMA_URL    = "http://localhost:11434/api/generate"
 
 CLIP_MIN_SEC  = 60
-CLIP_MAX_SEC  = 150   # 2m30s max
+CLIP_MAX_SEC  = 150   # 2m30s max — default cap, overridable via max_clip_length
 OLLAMA_TIMEOUT = 600
 
-FIXED_CLIP_SEC     = 60   # length used when AI clipping is disabled
-FIXED_CLIP_MIN_TAIL = 10  # drop a trailing fragment shorter than this
+FIXED_CLIP_SEC     = 60   # default length used when AI clipping is disabled
+FIXED_CLIP_MIN_TAIL = 10  # drop a trailing fragment shorter than this (scaled down for short clip lengths)
 
 MODELS = {
     "1": {"name": "llama3:latest",  "label": "llama3 8B (slower, smarter)"},
@@ -47,6 +47,8 @@ def log_err(msg):  print(f"  ❌ {msg}", flush=True)
 
 
 def choose_model() -> str:
+    """Interactive terminal picker — only used when no model is passed in
+    explicitly (e.g. running main.py without --model from a real terminal)."""
     import threading
 
     print("\n  Choose Ollama model for clip analysis:")
@@ -277,13 +279,18 @@ def find_sentence_boundary(srt_entries: list, target: float, window: float = 10.
     return best
 
 
-def build_clip_plan(srt_entries: list, skip_ranges: list, duration: float) -> list:
+def build_clip_plan(
+    srt_entries: list, skip_ranges: list, duration: float,
+    max_clip_sec: float = CLIP_MAX_SEC, min_clip_sec: float = CLIP_MIN_SEC,
+) -> list:
     """
     Returns a list of clip dicts:
       { clip, start_sec, end_sec, start, end, duration }
     No video is touched here — pure time math.
+    max_clip_sec/min_clip_sec let the caller (main.py / gui.py slider)
+    control how long each Short is allowed to be.
     """
-    log_step("Building clip plan (AI-assisted)...")
+    log_step(f"Building clip plan (AI-assisted, {min_clip_sec:.0f}-{max_clip_sec:.0f}s per clip)...")
 
     skip_sorted = sorted(skip_ranges, key=lambda x: x["start"])
     usable, cursor = [], 0.0
@@ -302,18 +309,18 @@ def build_clip_plan(srt_entries: list, skip_ranges: list, duration: float) -> li
 
     clips, idx = [], 1
     for (rstart, rend) in usable:
-        if (rend - rstart) < CLIP_MIN_SEC:
+        if (rend - rstart) < min_clip_sec:
             log_warn(f"Range too short ({rend-rstart:.0f}s) — skipping.")
             continue
         pos = rstart
         while pos < rend:
-            if (rend - pos) < CLIP_MIN_SEC:
+            if (rend - pos) < min_clip_sec:
                 break
-            target_end  = min(pos + CLIP_MAX_SEC, rend)
+            target_end  = min(pos + max_clip_sec, rend)
             snapped_end = find_sentence_boundary(srt_entries, target_end, window=10.0)
-            snapped_end = min(max(snapped_end, pos + CLIP_MIN_SEC), rend)
+            snapped_end = min(max(snapped_end, pos + min_clip_sec), rend)
             dur = snapped_end - pos
-            if dur < CLIP_MIN_SEC:
+            if dur < min_clip_sec:
                 break
 
             m1, s1 = divmod(int(pos), 60)
@@ -340,15 +347,17 @@ def build_fixed_clip_plan(duration: float, clip_length: float = FIXED_CLIP_SEC) 
     """
     AI clipping disabled: no skip-range analysis, no Ollama call, no sentence
     snapping. Just mechanically slices the entire video into fixed-length
-    (default 1 minute) clips back-to-back.
+    (default 1 minute) clips back-to-back. clip_length is fully controlled
+    by the caller (main.py --max-length / the gui.py slider).
     """
+    min_tail = min(FIXED_CLIP_MIN_TAIL, max(clip_length * 0.3, 1))
     log_step(f"Building fixed {clip_length:.0f}s clip plan (AI clipping disabled)...")
 
     clips, idx, pos = [], 1, 0.0
     while pos < duration:
         end = min(pos + clip_length, duration)
         dur = end - pos
-        if dur < FIXED_CLIP_MIN_TAIL:
+        if dur < min_tail:
             log_warn(f"Trailing {dur:.0f}s fragment too short — dropping.")
             break
 
@@ -372,7 +381,10 @@ def build_fixed_clip_plan(duration: float, clip_length: float = FIXED_CLIP_SEC) 
 
 # ── Pipeline entry ───────────────────────────────────────────────────────────
 
-def clip_pipeline(video_dir: str, use_ai: bool = True) -> dict:
+def clip_pipeline(
+    video_dir: str, use_ai: bool = True,
+    max_clip_length: float = None, model: str = None,
+) -> dict:
     """
     Analyses the video and returns everything Step 3 needs to render in one pass:
       {
@@ -388,11 +400,16 @@ def clip_pipeline(video_dir: str, use_ai: bool = True) -> dict:
     use_ai=True  (default): Ollama identifies ad/intro/outro skip ranges,
                   cut points are snapped to sentence boundaries (original behavior).
     use_ai=False: skips model selection and the Ollama call entirely — the
-                  whole video is just chopped into fixed ~1-minute clips.
+                  whole video is just chopped into fixed-length clips.
+    max_clip_length: caps how long each clip is allowed to be (AI mode), or
+                  sets the exact clip length (non-AI mode). Falls back to
+                  CLIP_MAX_SEC / FIXED_CLIP_SEC if not given.
+    model: Ollama model name to use for skip-range analysis. If not given,
+                  falls back to the interactive terminal picker.
     """
     print("\n[Step 2] Planning clips (no rendering)")
     print("  " + "-" * 44)
-    print(f"  Mode: {'AI-assisted clipping' if use_ai else 'Fixed 1-minute clips (AI clipping disabled)'}")
+    print(f"  Mode: {'AI-assisted clipping' if use_ai else 'Fixed-length clips (AI clipping disabled)'}")
 
     video_path  = load_video_file(video_dir)
     if not video_path:
@@ -408,13 +425,19 @@ def clip_pipeline(video_dir: str, use_ai: bool = True) -> dict:
     width, height = get_video_dimensions(video_path)
     log_ok(f"Source: {width}x{height}")
 
+    effective_max = max_clip_length if max_clip_length else (CLIP_MAX_SEC if use_ai else FIXED_CLIP_SEC)
+    effective_min = CLIP_MIN_SEC if effective_max >= CLIP_MIN_SEC else max(10.0, effective_max * 0.5)
+
     if use_ai:
-        model       = choose_model()
+        model_name = model if model else choose_model()
         chapters    = load_chapters(video_dir)
-        skip_ranges = ask_ollama_for_skip_ranges(model, srt_entries, chapters, duration)
-        clips       = build_clip_plan(srt_entries, skip_ranges, duration)
+        skip_ranges = ask_ollama_for_skip_ranges(model_name, srt_entries, chapters, duration)
+        clips       = build_clip_plan(
+            srt_entries, skip_ranges, duration,
+            max_clip_sec=effective_max, min_clip_sec=effective_min,
+        )
     else:
-        clips = build_fixed_clip_plan(duration, clip_length=FIXED_CLIP_SEC)
+        clips = build_fixed_clip_plan(duration, clip_length=effective_max)
 
     if not clips:
         log_err("No clips could be planned. Exiting.")
@@ -439,8 +462,20 @@ def clip_pipeline(video_dir: str, use_ai: bool = True) -> dict:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python3 step2_clip.py <video_dir> [--no-ai]")
+        print("Usage: python3 step2_clip.py <video_dir> [--no-ai] [--max-length SECONDS] [--model NAME]")
         sys.exit(1)
     use_ai = "--no-ai" not in sys.argv[2:]
-    result = clip_pipeline(sys.argv[1], use_ai=use_ai)
+    max_length = None
+    if "--max-length" in sys.argv:
+        try:
+            max_length = float(sys.argv[sys.argv.index("--max-length") + 1])
+        except (IndexError, ValueError):
+            pass
+    model_arg = None
+    if "--model" in sys.argv:
+        try:
+            model_arg = sys.argv[sys.argv.index("--model") + 1]
+        except IndexError:
+            pass
+    result = clip_pipeline(sys.argv[1], use_ai=use_ai, max_clip_length=max_length, model=model_arg)
     print(json.dumps(result["clips"], indent=2))

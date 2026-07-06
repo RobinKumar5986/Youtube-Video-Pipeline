@@ -28,6 +28,32 @@ FINAL_DIR = os.path.join(BASE_DIR, "FinalVideos")
 MAIN_PY = os.path.join(BASE_DIR, "main.py")
 CONFIG_PATH = os.path.join(BASE_DIR, "gui_config.json")
 
+# Mirrors step2_clip.MODELS — kept as plain strings here so the GUI doesn't
+# need to import the pipeline modules just to build a dropdown.
+MODEL_OPTIONS = {
+    "(default)": None,
+    "Llama3 8B (slower, smarter)": "llama3:latest",
+    "Llama3.2 1B (faster, lighter)": "llama3.2:1b",
+}
+
+# Mirrors step4_upload.TARGET_COUNTRIES keys — keep this list in sync if you
+# add/remove countries there.
+COUNTRY_OPTIONS = [
+    "(none)",
+    "United States",
+    "United Kingdom",
+    "Canada",
+    "Australia",
+    "Germany",
+    "Netherlands",
+    "Sweden",
+    "Ireland",
+]
+
+MIN_CLIP_LEN = 15
+MAX_CLIP_LEN = 180
+DEFAULT_CLIP_LEN = 60
+
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
@@ -146,7 +172,7 @@ class SortCliperGUI(ctk.CTk):
 
     def _build_layout(self):
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
+        self.grid_rowconfigure(4, weight=1)
 
         body_font = ctk.CTkFont(size=FONT_BODY)
 
@@ -204,7 +230,7 @@ class SortCliperGUI(ctk.CTk):
         )
         self.ai_clip_var = ctk.BooleanVar(value=self.cfg.get("ai_clip", True))
         self.ai_clip_check = ctk.CTkCheckBox(
-            opts, text="Clip by AI (uncheck = fixed 1-minute clips, no AI analysis)",
+            opts, text="Clip by AI (uncheck = fixed clips at the length below, no AI analysis)",
             variable=self.ai_clip_var, font=body_font
         )
         self.ai_clip_check.grid(row=0, column=1, columnspan=3, padx=(0, 12), pady=(12, 6), sticky="w")
@@ -231,9 +257,62 @@ class SortCliperGUI(ctk.CTk):
         )
         self._on_schedule_toggle()
 
+        # -- Section: Targeting (max length, model, country) --
+        target = ctk.CTkFrame(self)
+        target.grid(row=2, column=0, sticky="ew", padx=16, pady=8)
+        target.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(target, text="Max short length", font=ctk.CTkFont(size=FONT_BOLD, weight="bold")).grid(
+            row=0, column=0, padx=(12, 8), pady=(12, 6), sticky="w"
+        )
+        slider_row = ctk.CTkFrame(target, fg_color="transparent")
+        slider_row.grid(row=0, column=1, columnspan=3, padx=(0, 12), pady=(12, 6), sticky="ew")
+        slider_row.grid_columnconfigure(0, weight=1)
+
+        initial_len = int(self.cfg.get("max_clip_length", DEFAULT_CLIP_LEN))
+        initial_len = max(MIN_CLIP_LEN, min(initial_len, MAX_CLIP_LEN))
+        self.max_length_var = ctk.IntVar(value=initial_len)
+        self.max_length_slider = ctk.CTkSlider(
+            slider_row, from_=MIN_CLIP_LEN, to=MAX_CLIP_LEN,
+            number_of_steps=MAX_CLIP_LEN - MIN_CLIP_LEN,
+            variable=self.max_length_var, command=self._on_length_slide,
+        )
+        self.max_length_slider.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+        self.max_length_label = ctk.CTkLabel(
+            slider_row, text=f"{initial_len}s", font=body_font, width=round(50 * UI_SCALE)
+        )
+        self.max_length_label.grid(row=0, column=1, sticky="w")
+
+        ctk.CTkLabel(target, text="Model", font=ctk.CTkFont(size=FONT_BOLD, weight="bold")).grid(
+            row=1, column=0, padx=(12, 8), pady=(6, 6), sticky="w"
+        )
+        self.model_var = ctk.StringVar(value=self.cfg.get("model_label", "(default)"))
+        self.model_menu = ctk.CTkOptionMenu(
+            target, values=list(MODEL_OPTIONS.keys()), variable=self.model_var,
+            font=body_font, height=round(30 * UI_SCALE)
+        )
+        self.model_menu.grid(row=1, column=1, padx=(0, 12), pady=(6, 6), sticky="w")
+
+        ctk.CTkLabel(target, text="Target country", font=ctk.CTkFont(size=FONT_BOLD, weight="bold")).grid(
+            row=1, column=2, padx=(12, 8), pady=(6, 6), sticky="e"
+        )
+        self.country_var = ctk.StringVar(value=self.cfg.get("country", "(none)"))
+        self.country_menu = ctk.CTkOptionMenu(
+            target, values=COUNTRY_OPTIONS, variable=self.country_var,
+            font=body_font, height=round(30 * UI_SCALE)
+        )
+        self.country_menu.grid(row=1, column=3, padx=(0, 12), pady=(6, 6), sticky="w")
+
+        ctk.CTkLabel(
+            target,
+            text="Model applies to both clip analysis and metadata generation. Country tailors "
+                 "titles/hashtags/scheduling for that audience (source videos stay English).",
+            font=ctk.CTkFont(size=FONT_LABEL_SMALL), text_color="#8a8a8a", justify="left", wraplength=round(900 * UI_SCALE),
+        ).grid(row=2, column=0, columnspan=4, padx=12, pady=(0, 12), sticky="w")
+
         # -- Section: Step-by-step + folder select --
         mid = ctk.CTkFrame(self)
-        mid.grid(row=2, column=0, sticky="ew", padx=16, pady=8)
+        mid.grid(row=3, column=0, sticky="ew", padx=16, pady=8)
         mid.grid_columnconfigure(4, weight=1)
 
         ctk.CTkLabel(mid, text="Target folder (RawVideos/)", font=ctk.CTkFont(size=FONT_BOLD, weight="bold")).grid(
@@ -286,7 +365,7 @@ class SortCliperGUI(ctk.CTk):
 
         # -- Section: Log console --
         log_frame = ctk.CTkFrame(self)
-        log_frame.grid(row=3, column=0, sticky="nsew", padx=16, pady=(8, 16))
+        log_frame.grid(row=4, column=0, sticky="nsew", padx=16, pady=(8, 16))
         log_frame.grid_columnconfigure(0, weight=1)
         log_frame.grid_rowconfigure(1, weight=1)
 
@@ -305,6 +384,9 @@ class SortCliperGUI(ctk.CTk):
     def _on_schedule_toggle(self):
         state = "normal" if self.schedule_var.get() else "disabled"
         self.schedule_interval_entry.configure(state=state)
+
+    def _on_length_slide(self, value):
+        self.max_length_label.configure(text=f"{int(round(value))}s")
 
     # ── Folder handling ─────────────────────────────────────────────────
 
@@ -351,12 +433,26 @@ class SortCliperGUI(ctk.CTk):
             return []
         return ["--account", label]
 
-    # ── Clipping / scheduling option handling ────────────────────────────
+    # ── Clipping / scheduling / targeting option handling ────────────────
 
     def clip_args(self):
         """Returns [] if AI clipping is on (default main.py behavior), or
         ['--no-ai-clip'] if the checkbox is unchecked."""
         return [] if self.ai_clip_var.get() else ["--no-ai-clip"]
+
+    def max_length_args(self):
+        """Always passes --max-length so the slider is authoritative."""
+        return ["--max-length", str(int(round(self.max_length_var.get())))]
+
+    def model_args(self):
+        """Returns ['--model', NAME] unless '(default)' is selected."""
+        model_name = MODEL_OPTIONS.get(self.model_var.get())
+        return ["--model", model_name] if model_name else []
+
+    def country_args(self):
+        """Returns ['--country', NAME] unless '(none)' is selected."""
+        country = self.country_var.get()
+        return ["--country", country] if country and country != "(none)" else []
 
     def schedule_args(self):
         """Returns ['--schedule', '--schedule-interval', 'N'] if scheduling
@@ -384,9 +480,12 @@ class SortCliperGUI(ctk.CTk):
         privacy = self.privacy_var.get()
         args = [url, "--privacy", privacy]
         args += self.clip_args()
+        args += self.max_length_args()
+        args += self.model_args()
         if not self.no_upload_var.get():
             args += self.selected_account_args()
             args += self.schedule_args()
+            args += self.country_args()
         if self.no_upload_var.get():
             args.append("--no-upload")
         self._persist_config(
@@ -395,6 +494,9 @@ class SortCliperGUI(ctk.CTk):
             ai_clip=self.ai_clip_var.get(),
             schedule=self.schedule_var.get(),
             schedule_interval=self.schedule_interval_var.get(),
+            max_clip_length=int(round(self.max_length_var.get())),
+            model_label=self.model_var.get(),
+            country=self.country_var.get(),
         )
         self._run(args, stdin_lines=None)
 
@@ -407,8 +509,13 @@ class SortCliperGUI(ctk.CTk):
         self._run(["1", url])
 
     def run_step2(self):
-        self._persist_config(ai_clip=self.ai_clip_var.get())
-        self._run_with_folder_choice(["2"] + self.clip_args())
+        self._persist_config(
+            ai_clip=self.ai_clip_var.get(),
+            max_clip_length=int(round(self.max_length_var.get())),
+            model_label=self.model_var.get(),
+        )
+        args = ["2"] + self.clip_args() + self.max_length_args() + self.model_args()
+        self._run_with_folder_choice(args)
 
     def run_step3(self):
         self._run_with_folder_choice(["3"])
@@ -418,8 +525,11 @@ class SortCliperGUI(ctk.CTk):
         self._persist_config(
             privacy=privacy, last_account=self.account_var.get(),
             schedule=self.schedule_var.get(), schedule_interval=self.schedule_interval_var.get(),
+            model_label=self.model_var.get(), country=self.country_var.get(),
         )
-        args = ["4", "--privacy", privacy] + self.selected_account_args() + self.schedule_args()
+        args = ["4", "--privacy", privacy]
+        args += self.selected_account_args() + self.schedule_args()
+        args += self.model_args() + self.country_args()
         self._run_with_folder_choice(args)
 
     def _run_with_folder_choice(self, args):

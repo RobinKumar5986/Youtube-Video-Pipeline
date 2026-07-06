@@ -30,9 +30,33 @@ Setup (one-time, per channel):
 
 SCHEDULING: when upload_pipeline(..., schedule=True) is used, clips are not
 all published immediately. Instead each one is uploaded as "private" with a
-publishAt timestamp spaced schedule_interval_hours apart (default 2h), so
-YouTube auto-publishes them one at a time on a drip schedule instead of
-dropping every clip on the channel at once.
+publishAt timestamp. If a target `country` is given, the publish times are
+snapped to that country's local peak-engagement window (see
+TARGET_COUNTRIES) instead of just "now + N hours" — so drip-scheduled clips
+land when that audience is actually online, spaced schedule_interval_hours
+apart within the window.
+
+COUNTRY TARGETING: since this pipeline only downloads/clips English-language
+source videos, the "target country" feature is aimed at English-speaking or
+highly English-fluent audiences. It doesn't change what language the video
+is in — it adjusts (a) the tone/phrasing instructions given to the metadata
+LLM, (b) which discovery hashtags get added, (c) the declared
+defaultLanguage/defaultAudioLanguage on the uploaded video, and (d) the
+scheduled publish time, all to bias the algorithm and viewers in that
+country towards recommending/watching the clip.
+
+DAILY UPLOAD LIMIT HANDLING: YouTube enforces an account-level "how many
+videos may this channel/app upload right now" cap that is separate from API
+quota units. It shows up as HttpError 400/403 with
+reason == 'uploadLimitExceeded'. This is NOT the same as quotaExceeded
+(which means your Cloud project's daily unit budget ran out) — Google does
+not publish an exact number for uploadLimitExceeded, and it's tied to
+channel/app trust level, not a fixed daily count. Since it applies to the
+whole channel for the rest of the window, once one clip hits it every
+remaining clip in the batch will fail identically — so upload_pipeline()
+detects it on the first occurrence, stops immediately instead of burning
+through the rest of the batch, and logs a clear summary of what uploaded,
+what was skipped, and why.
 """
 
 import os
@@ -62,7 +86,7 @@ def log_err(msg):  print(f"  ❌ {msg}", flush=True)
 # ── Local AI config (same Ollama instance as step2_clip.py) ────────────────
 
 OLLAMA_URL     = "http://localhost:11434/api/generate"
-OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")  # fast model, plenty for short metadata
+OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")  # fast model, plenty for short metadata — overridable via model= param
 OLLAMA_TIMEOUT = 300
 MAX_TAGS           = 30   # YouTube tags field (not shown to viewers, used for search/discovery)
 MAX_HASHTAGS       = 20   # hashtags appended to the description (viewers see these)
@@ -80,6 +104,71 @@ TOKEN_FILE          = os.environ.get("YT_TOKEN_FILE", "token.json")
 DEFAULT_CATEGORY_ID = "22"  # People & Blogs
 DEFAULT_PRIVACY     = os.environ.get("YT_PRIVACY", "private")  # private | unlisted | public
 DEFAULT_SCHEDULE_INTERVAL_HOURS = 2.0
+
+# Reasons returned by the YouTube API that mean "stop hitting this channel
+# right now, nothing else in the batch will succeed either" — as opposed to
+# a one-off per-video failure (bad metadata, corrupt file, etc.) that only
+# affects that single clip.
+STOP_BATCH_REASONS = {"uploadLimitExceeded", "quotaExceeded", "dailyLimitExceeded"}
+
+# ── Target-country viral strategy presets ───────────────────────────────────
+# code:          ISO 3166-1 alpha-2, used for defaultLanguage/defaultAudioLanguage
+# audio_lang:    BCP-47 tag declared on the upload (content itself stays English)
+# utc_offset:    hours from UTC, used to convert scheduled publish times to local peak hours
+# peak_hours:    (start, end) 24h local window where Shorts scrolling is typically highest
+# hashtag_extra: region hashtags mixed into the description ahead of the generic baseline
+# tone:          style guidance injected into the metadata-generation prompt
+TARGET_COUNTRIES = {
+    "United States": {
+        "code": "US", "audio_lang": "en-US", "utc_offset": -5, "peak_hours": (11, 22),
+        "hashtag_extra": ["usa", "america", "fyp"],
+        "tone": "Punchy, high-energy American hook in the very first sentence. Casual US slang "
+                "and pop-culture references. Assume a fast-scrolling audience deciding whether "
+                "to keep watching within the first 1-2 seconds.",
+    },
+    "United Kingdom": {
+        "code": "GB", "audio_lang": "en-GB", "utc_offset": 1, "peak_hours": (12, 22),
+        "hashtag_extra": ["uk", "british", "fyp"],
+        "tone": "Dry British humor and understated wit. British spelling (colour, favourite). "
+                "Reference everyday UK-relatable situations rather than US pop culture.",
+    },
+    "Canada": {
+        "code": "CA", "audio_lang": "en-CA", "utc_offset": -5, "peak_hours": (11, 22),
+        "hashtag_extra": ["canada", "canadian", "fyp"],
+        "tone": "Friendly, approachable North American tone. Keep references broadly relatable "
+                "to a Canadian audience rather than US-only.",
+    },
+    "Australia": {
+        "code": "AU", "audio_lang": "en-AU", "utc_offset": 10, "peak_hours": (12, 22),
+        "hashtag_extra": ["australia", "aussie", "fyp"],
+        "tone": "Laid-back, upbeat Australian tone with light larrikin humor. Short, energetic "
+                "sentences.",
+    },
+    "Germany": {
+        "code": "DE", "audio_lang": "en-US", "utc_offset": 1, "peak_hours": (17, 23),
+        "hashtag_extra": ["germany", "deutschland", "fyp"],
+        "tone": "Clear, direct, information-dense delivery — this audience consumes English "
+                "content fluently and responds better to concrete facts than to hype.",
+    },
+    "Netherlands": {
+        "code": "NL", "audio_lang": "en-US", "utc_offset": 1, "peak_hours": (17, 23),
+        "hashtag_extra": ["netherlands", "holland", "fyp"],
+        "tone": "Direct, pragmatic, a little dry. Dutch viewers are highly fluent in English and "
+                "respond to genuine, no-nonsense framing over exaggerated hype.",
+    },
+    "Sweden": {
+        "code": "SE", "audio_lang": "en-US", "utc_offset": 1, "peak_hours": (16, 23),
+        "hashtag_extra": ["sweden", "swedish", "fyp"],
+        "tone": "Calm, understated, minimalist tone. Avoid over-the-top hype — let the content "
+                "quality carry a confident, low-key delivery.",
+    },
+    "Ireland": {
+        "code": "IE", "audio_lang": "en-IE", "utc_offset": 0, "peak_hours": (12, 22),
+        "hashtag_extra": ["ireland", "irish", "fyp"],
+        "tone": "Warm, witty, conversational tone — friendly storytelling with a joke never far "
+                "away.",
+    },
+}
 
 
 # ── Multi-channel account discovery ─────────────────────────────────────────
@@ -183,13 +272,26 @@ def get_clip_transcript(srt_entries: list, start_sec: float, end_sec: float) -> 
     return " ".join(texts).strip()
 
 
-def build_prompt(transcript: str, clip_idx: int) -> str:
+def build_prompt(transcript: str, clip_idx: int, country: str = None) -> str:
     context = transcript if transcript else f"(No transcript text found for clip {clip_idx}.)"
+
+    country_block = ""
+    info = TARGET_COUNTRIES.get(country)
+    if info:
+        country_block = (
+            f"\nTARGET AUDIENCE: {country} viewers (the clip's audio/captions stay in English).\n"
+            f"STYLE GUIDANCE FOR THIS AUDIENCE: {info['tone']}\n"
+            "Naturally weave in phrasing and keywords that resonate with this specific audience "
+            "without being cringe or forced — the goal is higher watch time and shares from "
+            "viewers in this country.\n"
+        )
+
     return (
         "You are an expert YouTube Shorts SEO copywriter. Based on the transcript "
         "snippet below, write rich, search-optimized metadata for a short vertical "
         "clip upload. The description must be genuinely long and informative — do "
-        "not be lazy or terse.\n\n"
+        "not be lazy or terse.\n"
+        f"{country_block}\n"
         f'TRANSCRIPT:\n"""{context[:4000]}"""\n\n'
         "Reply ONLY with a JSON object, no markdown fences, no commentary, "
         "in this exact shape:\n"
@@ -209,13 +311,14 @@ def build_prompt(transcript: str, clip_idx: int) -> str:
     )
 
 
-def call_ollama(prompt: str) -> str:
+def call_ollama(prompt: str, model: str = None) -> str:
+    use_model = model or OLLAMA_MODEL
     t0 = time.time()
     try:
         resp = requests.post(
             OLLAMA_URL,
             json={
-                "model": OLLAMA_MODEL,
+                "model": use_model,
                 "prompt": prompt,
                 "stream": False,
                 "options": {"temperature": 0.5, "num_predict": 900},
@@ -223,7 +326,7 @@ def call_ollama(prompt: str) -> str:
             timeout=OLLAMA_TIMEOUT,
         )
         resp.raise_for_status()
-        log_ok(f"Ollama responded in {time.time()-t0:.1f}s")
+        log_ok(f"Ollama ({use_model}) responded in {time.time()-t0:.1f}s")
         return resp.json().get("response", "")
     except requests.exceptions.ReadTimeout:
         log_warn(f"Ollama timed out after {time.time()-t0:.0f}s.")
@@ -246,7 +349,7 @@ def _clean_tag_list(raw_list, limit):
     return cleaned
 
 
-def parse_metadata(raw: str, fallback_name: str, transcript: str = "") -> dict:
+def parse_metadata(raw: str, fallback_name: str, transcript: str = "", country: str = None) -> dict:
     start, end = raw.find("{"), raw.rfind("}") + 1
     if start == -1 or end == 0:
         log_warn("No JSON object in Ollama response — using fallback metadata.")
@@ -274,9 +377,11 @@ def parse_metadata(raw: str, fallback_name: str, transcript: str = "") -> dict:
                 f"In this clip: {filler[:600]}"
             )
 
-    # Always guarantee a baseline set of discovery hashtags even if the LLM gave none.
+    # Country-specific discovery hashtags go first, then the generic baseline —
+    # both capped by MAX_HASHTAGS.
+    country_hashtags = TARGET_COUNTRIES.get(country, {}).get("hashtag_extra", [])
     baseline_hashtags = ["shorts", "viral", "trending", "fyp", "youtubeshorts"]
-    for h in baseline_hashtags:
+    for h in country_hashtags + baseline_hashtags:
         if h not in meta["hashtags"] and len(meta["hashtags"]) < MAX_HASHTAGS:
             meta["hashtags"].append(h)
 
@@ -293,13 +398,15 @@ def parse_metadata(raw: str, fallback_name: str, transcript: str = "") -> dict:
     return meta
 
 
-def generate_all_metadata(plan: dict, final_dir: Path) -> dict:
+def generate_all_metadata(plan: dict, final_dir: Path, model: str = None, country: str = None) -> dict:
     """Returns {file_path: {title, description, tags}} for every rendered clip."""
     srt_entries  = plan.get("srt_entries", [])
     clips        = plan.get("clips", [])
     filename_map = load_filename_map(final_dir)
 
-    log_step(f"Generating metadata for {len(clips)} clip(s) via {OLLAMA_MODEL}")
+    use_model = model or OLLAMA_MODEL
+    log_step(f"Generating metadata for {len(clips)} clip(s) via {use_model}"
+              + (f" (targeting: {country})" if country else ""))
     results = {}
 
     for c in clips:
@@ -313,13 +420,42 @@ def generate_all_metadata(plan: dict, final_dir: Path) -> dict:
         fallback_name = f"Part {clip_idx}"
 
         log(f"Clip {clip_idx} ({out_file.name}) [{c['start']} → {c['end']}]")
-        raw = call_ollama(build_prompt(transcript, clip_idx))
-        meta = parse_metadata(raw, fallback_name, transcript)
+        raw = call_ollama(build_prompt(transcript, clip_idx, country), model=model)
+        meta = parse_metadata(raw, fallback_name, transcript, country=country)
         log_ok(f'"{meta["title"]}"  ({len(meta["description"].split())} words, {len(meta["tags"])} tags)')
 
         results[out_file] = meta
 
     return results
+
+
+# ── Scheduling helpers ───────────────────────────────────────────────────────
+
+def next_scheduled_time(now_utc: datetime, slot_index: int, interval_hours: float, country: str = None) -> datetime:
+    """
+    Naively, slot N publishes at now + interval*(N+1). If a target country is
+    given, that naive time gets snapped into the country's local peak-hours
+    window (pulled forward to the window start if too early, pushed to the
+    next day's window start if too late), so drip-scheduled Shorts land when
+    that audience is actually scrolling instead of at an arbitrary UTC hour.
+    """
+    naive_target = now_utc + timedelta(hours=interval_hours * (slot_index + 1))
+
+    info = TARGET_COUNTRIES.get(country)
+    if not info:
+        return naive_target
+
+    tz = timezone(timedelta(hours=info["utc_offset"]))
+    local_target = naive_target.astimezone(tz)
+    peak_start, peak_end = info["peak_hours"]
+    local_hour = local_target.hour + local_target.minute / 60
+
+    if local_hour < peak_start:
+        local_target = local_target.replace(hour=peak_start, minute=0, second=0, microsecond=0)
+    elif local_hour > peak_end:
+        local_target = (local_target + timedelta(days=1)).replace(hour=peak_start, minute=0, second=0, microsecond=0)
+
+    return local_target.astimezone(timezone.utc)
 
 
 # ── YouTube upload ───────────────────────────────────────────────────────────
@@ -359,7 +495,7 @@ def youtube_authenticate(client_secret_file: str = None, token_file: str = None)
     return googleapiclient.discovery.build("youtube", "v3", credentials=creds)
 
 
-def upload_video(youtube, file_path: Path, meta: dict, privacy_status: str, publish_at: str = None) -> str:
+def upload_video(youtube, file_path: Path, meta: dict, privacy_status: str, publish_at: str = None, country: str = None) -> str:
     safe_title = sanitize_text(meta["title"], 100) or "Untitled"
     safe_description = sanitize_text(meta["description"], 5000)
     safe_tags = [sanitize_text(t, 30) for t in meta["tags"]]
@@ -375,15 +511,20 @@ def upload_video(youtube, file_path: Path, meta: dict, privacy_status: str, publ
         status["privacyStatus"] = "private"
         status["publishAt"] = publish_at
 
-    body = {
-        "snippet": {
-            "title": safe_title,
-            "description": safe_description,
-            "tags": safe_tags,
-            "categoryId": DEFAULT_CATEGORY_ID,
-        },
-        "status": status,
+    snippet = {
+        "title": safe_title,
+        "description": safe_description,
+        "tags": safe_tags,
+        "categoryId": DEFAULT_CATEGORY_ID,
     }
+    info = TARGET_COUNTRIES.get(country)
+    if info:
+        # Declares the intended audience's language to YouTube's recommendation
+        # system even though the spoken content is English.
+        snippet["defaultLanguage"] = info["audio_lang"]
+        snippet["defaultAudioLanguage"] = info["audio_lang"]
+
+    body = {"snippet": snippet, "status": status}
     media = googleapiclient.http.MediaFileUpload(
         str(file_path), chunksize=-1, resumable=True, mimetype="video/mp4"
     )
@@ -403,6 +544,22 @@ def upload_video(youtube, file_path: Path, meta: dict, privacy_status: str, publ
     return video_id
 
 
+def _extract_reason(http_error: googleapiclient.errors.HttpError) -> str:
+    """Pull the machine-readable 'reason' (e.g. 'uploadLimitExceeded',
+    'quotaExceeded') out of an HttpError, or '' if it can't be parsed."""
+    try:
+        content = http_error.content
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="replace")
+        data = json.loads(content)
+        errors = data.get("error", {}).get("errors", [])
+        if errors:
+            return errors[0].get("reason", "")
+        return data.get("error", {}).get("status", "")
+    except Exception:
+        return ""
+
+
 # ── Pipeline entry ───────────────────────────────────────────────────────────
 
 def upload_pipeline(
@@ -414,6 +571,8 @@ def upload_pipeline(
     token_file: str = None,
     schedule: bool = False,
     schedule_interval_hours: float = DEFAULT_SCHEDULE_INTERVAL_HOURS,
+    model: str = None,
+    country: str = None,
 ) -> dict:
     """
     plan: dict returned by step2_clip.clip_pipeline()
@@ -421,11 +580,21 @@ def upload_pipeline(
     account: channel label to resolve via discover_accounts() (e.g. "Gaming").
              Ignored if client_secret_file/token_file are passed explicitly.
     schedule: if True, clips are NOT all published at once. Each is uploaded
-              privately with a publishAt timestamp spaced
-              schedule_interval_hours apart (1st clip publishes after one
-              interval, 2nd after two intervals, etc.) so YouTube drips them
-              out on a schedule instead of dropping everything simultaneously.
+              privately with a publishAt timestamp — see next_scheduled_time()
+              for how `country` shifts these into that audience's local peak
+              hours.
     schedule_interval_hours: hours between each scheduled clip (default 2).
+    model: Ollama model used for metadata generation. Falls back to
+              OLLAMA_MODEL/env if not given.
+    country: key into TARGET_COUNTRIES. Adjusts metadata tone, discovery
+              hashtags, declared audio/description language, and (if
+              scheduling) publish timing, to target that audience.
+
+    Stops the batch immediately (instead of retrying every remaining clip
+    into a guaranteed failure) if YouTube returns a channel-wide blocking
+    reason — see STOP_BATCH_REASONS — and prints a clear summary of what
+    uploaded, what was skipped, and why.
+
     Returns: {file_path_str: youtube_video_id_or_None}
     """
     if not client_secret_file or not token_file:
@@ -440,7 +609,7 @@ def upload_pipeline(
     print("  " + "-" * 44)
 
     final_dir = Path(final_dir)
-    metadata = generate_all_metadata(plan, final_dir)
+    metadata = generate_all_metadata(plan, final_dir, model=model, country=country)
     if not metadata:
         log_err("No clips with metadata to upload.")
         return {}
@@ -448,36 +617,86 @@ def upload_pipeline(
     youtube = youtube_authenticate(client_secret_file, token_file)
 
     if schedule:
+        target_note = f", targeting {country} peak hours" if country in TARGET_COUNTRIES else ""
         log_step(
             f"Scheduling {len(metadata)} clip(s) to '{channel_label}', "
-            f"{schedule_interval_hours:g}h apart (first publishes in {schedule_interval_hours:g}h)"
+            f"{schedule_interval_hours:g}h apart{target_note}"
         )
     else:
         log_step(f"Uploading {len(metadata)} clip(s) to '{channel_label}' (privacy={privacy})")
 
     results = {}
+    skipped = []          # [(file_path, reason)] for clips never attempted after a stop
+    stop_reason = None
     now = datetime.now(timezone.utc)
-    for i, (file_path, meta) in enumerate(metadata.items()):
+    items = list(metadata.items())
+
+    for i, (file_path, meta) in enumerate(items):
         try:
             publish_at = None
             if schedule:
-                publish_time = now + timedelta(hours=schedule_interval_hours * (i + 1))
+                publish_time = next_scheduled_time(now, i, schedule_interval_hours, country)
                 publish_at = publish_time.strftime("%Y-%m-%dT%H:%M:%SZ")
-            video_id = upload_video(youtube, file_path, meta, privacy, publish_at=publish_at)
+            video_id = upload_video(youtube, file_path, meta, privacy, publish_at=publish_at, country=country)
             results[str(file_path)] = video_id
         except googleapiclient.errors.HttpError as e:
-            log_err(f"Failed to upload {file_path.name}: {e}")
+            reason = _extract_reason(e)
+            log_err(f"Failed to upload {file_path.name} (reason: {reason or 'unknown'}): {e}")
             results[str(file_path)] = None
 
+            if reason in STOP_BATCH_REASONS:
+                stop_reason = reason
+                remaining = items[i + 1:]
+                skipped = [(fp, reason) for fp, _ in remaining]
+                for fp, _ in remaining:
+                    results[str(fp)] = None
+                log_warn(
+                    f"'{reason}' is a channel/project-wide limit — every remaining clip "
+                    f"would fail the same way, so stopping the batch now instead of "
+                    f"retrying {len(remaining)} more upload(s)."
+                )
+                break
+
     ok = sum(1 for v in results.values() if v)
-    print(f"\n[Step 4] Done — {ok}/{len(results)} uploaded")
+    attempted = len(items) - len(skipped)
+    failed_attempted = attempted - ok
+
+    print("\n" + "=" * 60)
+    print(f"[Step 4] Upload summary — channel: {channel_label}")
+    print("=" * 60)
+    for file_path, meta in items:
+        video_id = results.get(str(file_path))
+        if video_id:
+            print(f"  ✅ {file_path.name} → https://youtu.be/{video_id}")
+        elif any(fp == file_path for fp, _ in skipped):
+            print(f"  ⏭️  {file_path.name} → SKIPPED (batch stopped: {stop_reason})")
+        else:
+            print(f"  ❌ {file_path.name} → FAILED")
+
+    print("-" * 60)
+    print(f"  Uploaded:  {ok}/{len(items)}")
+    print(f"  Failed:    {failed_attempted}/{len(items)} (attempted, rejected by YouTube)")
+    print(f"  Skipped:   {len(skipped)}/{len(items)} (never attempted, batch stopped early)")
+    if stop_reason:
+        print(f"  Stop reason: {stop_reason}")
+        if stop_reason == "uploadLimitExceeded":
+            print("  → This is YouTube's per-channel/app upload trust limit, separate from")
+            print("    API quota units. It typically resets on a rolling basis — re-run this")
+            print("    same command later (e.g. tomorrow) to upload the skipped clips.")
+        elif stop_reason in ("quotaExceeded", "dailyLimitExceeded"):
+            print("  → This is your Google Cloud project's daily API quota. It resets at")
+            print("    midnight Pacific Time — re-run this same command after that to upload")
+            print("    the skipped clips.")
+    print("=" * 60)
+
     return results
 
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
-        print("Usage: python3 step4_upload.py <video_dir> [account_label] [--schedule] [--interval HOURS]")
+        print("Usage: python3 step4_upload.py <video_dir> [account_label] [--schedule] [--interval HOURS] "
+              "[--model NAME] [--country \"United States\"]")
         print("  (loads clips_plan.json + RawVideos files, finds matching FinalVideos folder)")
         print("  account_label: e.g. 'Gaming' — matches a client_secret_gaming.json. Omit for Default.")
         sys.exit(1)
@@ -491,9 +710,22 @@ if __name__ == "__main__":
             interval = float(rest[rest.index("--interval") + 1])
         except (IndexError, ValueError):
             pass
+    model_arg = None
+    if "--model" in rest:
+        try:
+            model_arg = rest[rest.index("--model") + 1]
+        except IndexError:
+            pass
+    country_arg = None
+    if "--country" in rest:
+        try:
+            country_arg = rest[rest.index("--country") + 1]
+        except IndexError:
+            pass
+    consumed = {"--schedule", "--interval", str(interval), "--model", model_arg, "--country", country_arg}
     account_arg = None
     for a in rest:
-        if a not in ("--schedule", "--interval", str(interval)):
+        if a not in consumed:
             account_arg = a
             break
 
@@ -515,6 +747,9 @@ if __name__ == "__main__":
     final_dir = os.path.join(os.path.dirname(__file__), "FinalVideos", os.path.basename(video_dir))
     fake_plan = {"video_path": video_path, "video_dir": video_dir, "srt_entries": srt_entries, "clips": clips}
     print(json.dumps(
-        upload_pipeline(fake_plan, final_dir, account=account_arg, schedule=schedule_flag, schedule_interval_hours=interval),
+        upload_pipeline(
+            fake_plan, final_dir, account=account_arg, schedule=schedule_flag,
+            schedule_interval_hours=interval, model=model_arg, country=country_arg,
+        ),
         indent=2,
     ))
