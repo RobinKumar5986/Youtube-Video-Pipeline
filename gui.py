@@ -83,9 +83,9 @@ UI_SCALE = max(0.85, min(_raw_scale, 2.0))
 ctk.set_widget_scaling(UI_SCALE)
 ctk.set_window_scaling(UI_SCALE)
 
-# Widened: was 0.62 / 1400px max — the control rows (privacy, channel,
-# schedule interval, step buttons) were getting cramped. Now takes up more
-# of the available screen width, capped higher.
+# Kept at the original, screen-safe size — the log panel gets wider by
+# shrinking the control column's share (see grid_columnconfigure below),
+# not by growing the window itself.
 WIN_W = min(int(SCREEN_W * 0.80), 1760)
 WIN_H = min(int(SCREEN_H * 0.78), 1000)
 WIN_MIN_W = int(SCREEN_W * 0.55)
@@ -151,6 +151,45 @@ def list_accounts():
     return labels
 
 
+# Matches clip1_final.mp4, clip12_final.mp4, etc. — mirrors the filename
+# pattern step3_overlay.py renders each clip to.
+_FINAL_CLIP_RE = re.compile(r"^clip(?P<num>\d+)_final\.mp4$", re.IGNORECASE)
+
+
+def list_final_clips(folder_name: str):
+    """
+    Returns a sorted list of clip index numbers already rendered for the
+    given RawVideos folder name, by looking in FinalVideos/<folder_name>/.
+
+    Prefers final_metadata.json (written by step3_overlay.py) since it's the
+    authoritative clip -> file mapping; falls back to scanning for
+    clip<N>_final.mp4 files if that's missing.
+    Returns [] if the folder has no rendered clips yet (or none selected).
+    """
+    if not folder_name or folder_name == "(none)":
+        return []
+
+    final_folder = os.path.join(FINAL_DIR, folder_name)
+
+    meta_path = os.path.join(final_folder, "final_metadata.json")
+    if os.path.exists(meta_path):
+        try:
+            entries = json.load(open(meta_path))
+            return sorted(e["clip"] for e in entries)
+        except Exception:
+            pass
+
+    if not os.path.isdir(final_folder):
+        return []
+
+    indices = []
+    for f in os.listdir(final_folder):
+        m = _FINAL_CLIP_RE.match(f)
+        if m:
+            indices.append(int(m.group("num")))
+    return sorted(indices)
+
+
 class SortCliperGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -162,23 +201,35 @@ class SortCliperGUI(ctk.CTk):
         self.cfg = load_config()
         self.proc = None
         self.log_queue = queue.Queue()
+        self.clip_vars = {}  # clip index -> BooleanVar, for the current folder
 
         self._build_layout()
         self.refresh_folders()
         self.refresh_accounts()
+        self.refresh_clips()
         self.after(100, self._drain_log_queue)
 
     # ── Layout ───────────────────────────────────────────────────────────
 
     def _build_layout(self):
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(4, weight=1)
+        self.grid_columnconfigure(1, weight=2)
+        self.grid_rowconfigure(0, weight=1)
 
         body_font = ctk.CTkFont(size=FONT_BODY)
+        self.body_font = body_font
+
+        # Left column holds every control section, stacked top to bottom.
+        # The log panel lives in its own column on the right (sticky="nsew"
+        # below) so it's always visible while you tweak settings or run
+        # steps — no need to scroll down to see what's happening.
+        left = ctk.CTkFrame(self, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="new")
+        left.grid_columnconfigure(0, weight=1)
 
         # -- Section: Full pipeline --
-        top = ctk.CTkFrame(self)
-        top.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        top = ctk.CTkFrame(left)
+        top.grid(row=0, column=0, sticky="ew", padx=(16, 8), pady=(16, 8))
         top.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(top, text="YouTube URL", font=ctk.CTkFont(size=FONT_BOLD, weight="bold")).grid(
@@ -221,8 +272,8 @@ class SortCliperGUI(ctk.CTk):
         self.run_full_btn.grid(row=2, column=2, columnspan=2, padx=(0, 12), pady=(4, 12), sticky="e")
 
         # -- Section: Clipping + scheduling options --
-        opts = ctk.CTkFrame(self)
-        opts.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
+        opts = ctk.CTkFrame(left)
+        opts.grid(row=1, column=0, sticky="ew", padx=(16, 8), pady=8)
         opts.grid_columnconfigure(4, weight=1)
 
         ctk.CTkLabel(opts, text="Clipping", font=ctk.CTkFont(size=FONT_BOLD, weight="bold")).grid(
@@ -258,8 +309,8 @@ class SortCliperGUI(ctk.CTk):
         self._on_schedule_toggle()
 
         # -- Section: Targeting (max length, model, country) --
-        target = ctk.CTkFrame(self)
-        target.grid(row=2, column=0, sticky="ew", padx=16, pady=8)
+        target = ctk.CTkFrame(left)
+        target.grid(row=2, column=0, sticky="ew", padx=(16, 8), pady=8)
         target.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(target, text="Max short length", font=ctk.CTkFont(size=FONT_BOLD, weight="bold")).grid(
@@ -307,12 +358,12 @@ class SortCliperGUI(ctk.CTk):
             target,
             text="Model applies to both clip analysis and metadata generation. Country tailors "
                  "titles/hashtags/scheduling for that audience (source videos stay English).",
-            font=ctk.CTkFont(size=FONT_LABEL_SMALL), text_color="#8a8a8a", justify="left", wraplength=round(900 * UI_SCALE),
+            font=ctk.CTkFont(size=FONT_LABEL_SMALL), text_color="#8a8a8a", justify="left", wraplength=round(620 * UI_SCALE),
         ).grid(row=2, column=0, columnspan=4, padx=12, pady=(0, 12), sticky="w")
 
         # -- Section: Step-by-step + folder select --
-        mid = ctk.CTkFrame(self)
-        mid.grid(row=3, column=0, sticky="ew", padx=16, pady=8)
+        mid = ctk.CTkFrame(left)
+        mid.grid(row=3, column=0, sticky="ew", padx=(16, 8), pady=8)
         mid.grid_columnconfigure(4, weight=1)
 
         ctk.CTkLabel(mid, text="Target folder (RawVideos/)", font=ctk.CTkFont(size=FONT_BOLD, weight="bold")).grid(
@@ -321,12 +372,12 @@ class SortCliperGUI(ctk.CTk):
         self.folder_var = ctk.StringVar(value="(none)")
         self.folder_menu = ctk.CTkOptionMenu(
             mid, values=["(none)"], variable=self.folder_var,
-            font=body_font, height=round(30 * UI_SCALE)
+            font=body_font, height=round(30 * UI_SCALE), command=self._on_folder_change
         )
         self.folder_menu.grid(row=0, column=1, padx=(0, 8), pady=(12, 4), sticky="w")
 
         self.refresh_btn = ctk.CTkButton(
-            mid, text="↻ Refresh", width=round(100 * UI_SCALE), height=round(30 * UI_SCALE),
+            mid, text="↻ Refresh", width=round(86 * UI_SCALE), height=round(30 * UI_SCALE),
             font=body_font, command=self.refresh_all
         )
         self.refresh_btn.grid(row=0, column=2, padx=(0, 12), pady=(12, 4), sticky="w")
@@ -337,7 +388,7 @@ class SortCliperGUI(ctk.CTk):
         step_bar = ctk.CTkFrame(mid, fg_color="transparent")
         step_bar.grid(row=1, column=1, columnspan=4, padx=(0, 12), pady=(4, 12), sticky="ew")
 
-        btn_w = round(150 * UI_SCALE)
+        btn_w = round(128 * UI_SCALE)
         btn_h = round(34 * UI_SCALE)
         self.step1_btn = ctk.CTkButton(
             step_bar, text="1. Download", width=btn_w, height=btn_h, font=body_font, command=self.run_step1
@@ -357,15 +408,56 @@ class SortCliperGUI(ctk.CTk):
         self.step4_btn.pack(side="left", padx=6)
 
         self.cancel_btn = ctk.CTkButton(
-            step_bar, text="■ Cancel", width=round(110 * UI_SCALE), height=btn_h,
+            step_bar, text="■ Cancel", width=round(94 * UI_SCALE), height=btn_h,
             font=body_font, fg_color="#8B2E2E", hover_color="#6E2424",
             command=self.cancel_process
         )
         self.cancel_btn.pack(side="right")
 
-        # -- Section: Log console --
+        # -- Section: Clip selection (which rendered clips to upload) --
+        clips_frame = ctk.CTkFrame(left)
+        clips_frame.grid(row=4, column=0, sticky="ew", padx=(16, 8), pady=8)
+        clips_frame.grid_columnconfigure(0, weight=1)
+
+        clips_header = ctk.CTkFrame(clips_frame, fg_color="transparent")
+        clips_header.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 4))
+
+        ctk.CTkLabel(
+            clips_header, text="Clips to upload (FinalVideos/)",
+            font=ctk.CTkFont(size=FONT_BOLD, weight="bold")
+        ).pack(side="left")
+        self.clips_count_label = ctk.CTkLabel(
+            clips_header, text="", font=ctk.CTkFont(size=FONT_LABEL_SMALL), text_color="#8a8a8a"
+        )
+        self.clips_count_label.pack(side="left", padx=(10, 0))
+
+        clip_btns = ctk.CTkFrame(clips_header, fg_color="transparent")
+        clip_btns.pack(side="right")
+        ctk.CTkButton(
+            clip_btns, text="Select all", width=round(78 * UI_SCALE), height=round(26 * UI_SCALE),
+            font=body_font, command=self.select_all_clips
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            clip_btns, text="Deselect all", width=round(88 * UI_SCALE), height=round(26 * UI_SCALE),
+            font=body_font, command=self.deselect_all_clips
+        ).pack(side="left")
+
+        self.clips_scroll = ctk.CTkScrollableFrame(
+            clips_frame, height=round(110 * UI_SCALE), fg_color="transparent"
+        )
+        self.clips_scroll.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+
+        ctk.CTkLabel(
+            clips_frame,
+            text="Unchecked clips are skipped when you hit '4. Upload' — handy for staying under "
+                 "YouTube's daily upload limit. All clips are selected by default.",
+            font=ctk.CTkFont(size=FONT_LABEL_SMALL), text_color="#8a8a8a", justify="left",
+            wraplength=round(620 * UI_SCALE),
+        ).grid(row=2, column=0, padx=12, pady=(0, 12), sticky="w")
+
+        # -- Section: Log console (right-hand column, always visible) --
         log_frame = ctk.CTkFrame(self)
-        log_frame.grid(row=4, column=0, sticky="nsew", padx=16, pady=(8, 16))
+        log_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=16)
         log_frame.grid_columnconfigure(0, weight=1)
         log_frame.grid_rowconfigure(1, weight=1)
 
@@ -388,11 +480,15 @@ class SortCliperGUI(ctk.CTk):
     def _on_length_slide(self, value):
         self.max_length_label.configure(text=f"{int(round(value))}s")
 
+    def _on_folder_change(self, _choice=None):
+        self.refresh_clips()
+
     # ── Folder handling ─────────────────────────────────────────────────
 
     def refresh_all(self):
         self.refresh_folders()
         self.refresh_accounts()
+        self.refresh_clips()
 
     def refresh_folders(self):
         folders = list_raw_folders()
@@ -410,6 +506,79 @@ class SortCliperGUI(ctk.CTk):
         if current in folders:
             return folders.index(current) + 1
         return 1
+
+    # ── Clip selection handling (which rendered clips get uploaded) ─────
+
+    def refresh_clips(self):
+        """Rebuilds the clip checkboxes for whatever folder is currently
+        selected, based on what's actually been rendered to FinalVideos/."""
+        for w in self.clips_scroll.winfo_children():
+            w.destroy()
+        self.clip_vars = {}
+
+        folder = self.folder_var.get()
+        indices = list_final_clips(folder)
+
+        if not indices:
+            ctk.CTkLabel(
+                self.clips_scroll,
+                text="(no rendered clips found for this folder yet — run step 3)",
+                font=ctk.CTkFont(size=FONT_LABEL_SMALL), text_color="#8a8a8a",
+            ).grid(row=0, column=0, padx=4, pady=4, sticky="w")
+            self.clips_count_label.configure(text="")
+            return
+
+        # Restore a previous selection for this folder if we have one,
+        # otherwise default to everything checked.
+        prev_selected = self.cfg.get("selected_clips", {}).get(folder)
+
+        num_cols = 6
+        for i, idx in enumerate(indices):
+            r, c = divmod(i, num_cols)
+            checked = True if prev_selected is None else (idx in prev_selected)
+            var = ctk.BooleanVar(value=checked)
+            self.clip_vars[idx] = var
+            ctk.CTkCheckBox(
+                self.clips_scroll, text=f"Clip {idx}", variable=var, font=self.body_font
+            ).grid(row=r, column=c, padx=8, pady=4, sticky="w")
+
+        self.clips_count_label.configure(text=f"{len(indices)} clip(s) found")
+
+    def select_all_clips(self):
+        for v in self.clip_vars.values():
+            v.set(True)
+
+    def deselect_all_clips(self):
+        for v in self.clip_vars.values():
+            v.set(False)
+
+    def only_clip_args(self):
+        """
+        Returns ['--only-clips', '1,3,5'] if the user unchecked at least one
+        clip for the currently selected folder, else [] (meaning "upload
+        everything", same as main.py's default behavior when the flag is
+        omitted entirely).
+        """
+        folder = self.folder_var.get()
+        total = list_final_clips(folder)
+        if not total or not self.clip_vars:
+            return []
+
+        selected = sorted(idx for idx, v in self.clip_vars.items() if v.get())
+        if not selected:
+            self._log("⚠ No clips selected — uploading all clips instead.\n")
+            return []
+        if set(selected) == set(total):
+            return []
+        return ["--only-clips", ",".join(str(i) for i in selected)]
+
+    def _persist_selected_clips(self, folder):
+        if not folder or folder == "(none)" or not self.clip_vars:
+            return
+        selected = sorted(idx for idx, v in self.clip_vars.items() if v.get())
+        all_selected = self.cfg.get("selected_clips", {})
+        all_selected[folder] = selected
+        self.cfg["selected_clips"] = all_selected
 
     # ── Channel/account handling ─────────────────────────────────────────
 
@@ -522,6 +691,7 @@ class SortCliperGUI(ctk.CTk):
 
     def run_step4(self):
         privacy = self.privacy_var.get()
+        self._persist_selected_clips(self.folder_var.get())
         self._persist_config(
             privacy=privacy, last_account=self.account_var.get(),
             schedule=self.schedule_var.get(), schedule_interval=self.schedule_interval_var.get(),
@@ -530,6 +700,7 @@ class SortCliperGUI(ctk.CTk):
         args = ["4", "--privacy", privacy]
         args += self.selected_account_args() + self.schedule_args()
         args += self.model_args() + self.country_args()
+        args += self.only_clip_args()
         self._run_with_folder_choice(args)
 
     def _run_with_folder_choice(self, args):

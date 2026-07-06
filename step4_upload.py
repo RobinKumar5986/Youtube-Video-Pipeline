@@ -45,6 +45,13 @@ defaultLanguage/defaultAudioLanguage on the uploaded video, and (d) the
 scheduled publish time, all to bias the algorithm and viewers in that
 country towards recommending/watching the clip.
 
+CLIP SELECTION: upload_pipeline(..., only_clips=[1, 3, 5]) restricts a run
+to just the listed clip numbers (matching the "clip" index in
+clips_plan.json / final_metadata.json), skipping metadata generation and
+upload entirely for everything else. Useful for staying under YouTube's
+daily upload limit — see DAILY UPLOAD LIMIT HANDLING below. Leave it as
+None (the default) to upload every rendered clip, as before.
+
 DAILY UPLOAD LIMIT HANDLING: YouTube enforces an account-level "how many
 videos may this channel/app upload right now" cap that is separate from API
 quota units. It shows up as HttpError 400/403 with
@@ -573,6 +580,7 @@ def upload_pipeline(
     schedule_interval_hours: float = DEFAULT_SCHEDULE_INTERVAL_HOURS,
     model: str = None,
     country: str = None,
+    only_clips: list = None,
 ) -> dict:
     """
     plan: dict returned by step2_clip.clip_pipeline()
@@ -589,6 +597,13 @@ def upload_pipeline(
     country: key into TARGET_COUNTRIES. Adjusts metadata tone, discovery
               hashtags, declared audio/description language, and (if
               scheduling) publish timing, to target that audience.
+    only_clips: optional list of clip numbers (matching the "clip" index in
+              clips_plan.json) to restrict this run to. Clips not in this
+              list are skipped entirely — no metadata is generated and
+              nothing is uploaded for them. Pass None (default) to process
+              every rendered clip, as before. Useful for staying under
+              YouTube's daily upload limit by hand-picking which clips go
+              out in a given run.
 
     Stops the batch immediately (instead of retrying every remaining clip
     into a guaranteed failure) if YouTube returns a channel-wide blocking
@@ -609,6 +624,23 @@ def upload_pipeline(
     print("  " + "-" * 44)
 
     final_dir = Path(final_dir)
+
+    if only_clips:
+        only_set = set(only_clips)
+        all_clips = plan.get("clips", [])
+        filtered_clips = [c for c in all_clips if c["clip"] in only_set]
+        missing = only_set - {c["clip"] for c in filtered_clips}
+        if missing:
+            log_warn(f"Requested clip(s) not found in this plan, ignoring: {sorted(missing)}")
+        if not filtered_clips:
+            log_err("No matching clips to upload after applying --only-clips filter.")
+            return {}
+        log_step(
+            f"Restricting to {len(filtered_clips)}/{len(all_clips)} selected clip(s): "
+            f"{sorted(c['clip'] for c in filtered_clips)}"
+        )
+        plan = {**plan, "clips": filtered_clips}
+
     metadata = generate_all_metadata(plan, final_dir, model=model, country=country)
     if not metadata:
         log_err("No clips with metadata to upload.")
@@ -696,7 +728,7 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
         print("Usage: python3 step4_upload.py <video_dir> [account_label] [--schedule] [--interval HOURS] "
-              "[--model NAME] [--country \"United States\"]")
+              "[--model NAME] [--country \"United States\"] [--only-clips 1,3,5]")
         print("  (loads clips_plan.json + RawVideos files, finds matching FinalVideos folder)")
         print("  account_label: e.g. 'Gaming' — matches a client_secret_gaming.json. Omit for Default.")
         sys.exit(1)
@@ -722,7 +754,18 @@ if __name__ == "__main__":
             country_arg = rest[rest.index("--country") + 1]
         except IndexError:
             pass
-    consumed = {"--schedule", "--interval", str(interval), "--model", model_arg, "--country", country_arg}
+    only_clips_raw = None
+    only_clips_arg = None
+    if "--only-clips" in rest:
+        try:
+            only_clips_raw = rest[rest.index("--only-clips") + 1]
+            only_clips_arg = [int(x.strip()) for x in only_clips_raw.split(",") if x.strip()]
+        except (IndexError, ValueError):
+            only_clips_arg = None
+    consumed = {
+        "--schedule", "--interval", str(interval), "--model", model_arg,
+        "--country", country_arg, "--only-clips", only_clips_raw,
+    }
     account_arg = None
     for a in rest:
         if a not in consumed:
@@ -750,6 +793,7 @@ if __name__ == "__main__":
         upload_pipeline(
             fake_plan, final_dir, account=account_arg, schedule=schedule_flag,
             schedule_interval_hours=interval, model=model_arg, country=country_arg,
+            only_clips=only_clips_arg,
         ),
         indent=2,
     ))

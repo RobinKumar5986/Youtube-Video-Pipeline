@@ -19,6 +19,7 @@ Usage:
 
   python3 main.py 4 [--privacy private|unlisted|public] [--account NAME] [--schedule]
                      [--schedule-interval HOURS] [--model NAME] [--country "United States"]
+                     [--only-clips 1,3,5]
       → Step 4 only: generate metadata + upload already-rendered clips
 
   Steps 2-4 prompt you to pick a folder if more than one exists in
@@ -56,6 +57,12 @@ Usage:
   at once: clips are uploaded privately with a publishAt timestamp spaced
   --schedule-interval hours apart (default: 2h), snapped into --country's
   local peak-hours window when a country is given.
+
+  --only-clips 1,3,5 restricts Step 4's upload (in the full pipeline or as
+  a standalone step) to just the listed clip numbers (matching the "clip"
+  index in clips_plan.json / final_metadata.json). Handy for staying under
+  YouTube's daily per-channel upload limit — leave it out to upload every
+  rendered clip, as before.
 """
 
 import os
@@ -202,6 +209,7 @@ def run_pipeline(
     max_clip_length: float = None,
     model: str = None,
     country: str = None,
+    only_clips: list = None,
 ):
     print("=" * 50)
     print("         SortCliper Pipeline")
@@ -227,7 +235,7 @@ def run_pipeline(
         plan, final_dir, privacy=privacy,
         client_secret_file=acc["client_secret"], token_file=acc["token"],
         schedule=schedule, schedule_interval_hours=schedule_interval,
-        model=model, country=country,
+        model=model, country=country, only_clips=only_clips,
     )
     print_summary(final_dir, uploaded)
 
@@ -245,6 +253,7 @@ def run_step(
     max_clip_length: float = None,
     model: str = None,
     country: str = None,
+    only_clips: list = None,
 ):
     if step == 1:
         if not url:
@@ -278,7 +287,7 @@ def run_step(
             plan, final_dir, privacy=privacy,
             client_secret_file=acc["client_secret"], token_file=acc["token"],
             schedule=schedule, schedule_interval_hours=schedule_interval,
-            model=model, country=country,
+            model=model, country=country, only_clips=only_clips,
         )
         print_summary(final_dir, uploaded)
         return
@@ -332,9 +341,26 @@ if __name__ == "__main__":
         "--country", choices=list(TARGET_COUNTRIES.keys()), default=None,
         help="Target audience country for Step 4 metadata/hashtags/scheduling strategy."
     )
+    parser.add_argument(
+        "--only-clips", default=None,
+        help="Comma-separated clip numbers to upload in Step 4 (e.g. '1,3,5'), matching the "
+             "'clip' index in clips_plan.json / final_metadata.json. Omit to upload every "
+             "rendered clip. Useful for staying under YouTube's daily upload limit."
+    )
     args = parser.parse_args()
 
     use_ai = not args.no_ai_clip
+
+    only_clips = None
+    if args.only_clips:
+        try:
+            only_clips = [int(x.strip()) for x in args.only_clips.split(",") if x.strip()]
+        except ValueError:
+            print("❌ --only-clips must be a comma-separated list of integers, e.g. '1,3,5'.")
+            sys.exit(1)
+        if not only_clips:
+            print("❌ --only-clips was given but no clip numbers could be parsed from it.")
+            sys.exit(1)
 
     if args.target.isdigit():
         step = int(args.target)
@@ -345,10 +371,12 @@ if __name__ == "__main__":
             step, url=args.extra_url, privacy=args.privacy, account=args.account,
             use_ai=use_ai, schedule=args.schedule, schedule_interval=args.schedule_interval,
             max_clip_length=args.max_length, model=args.model, country=args.country,
+            only_clips=only_clips,
         )
     else:
         run_pipeline(
             args.target, privacy=args.privacy, do_upload=not args.no_upload, account=args.account,
             use_ai=use_ai, schedule=args.schedule, schedule_interval=args.schedule_interval,
             max_clip_length=args.max_length, model=args.model, country=args.country,
+            only_clips=only_clips,
         )
